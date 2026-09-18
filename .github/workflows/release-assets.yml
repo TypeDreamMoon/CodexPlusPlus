@@ -1,8 +1,17 @@
 name: Release assets
 
+# 两条触发路径：
+#   - 手动在 GitHub 上发布 Release 时直接构建（原有行为）
+#   - 由 release-on-tag.yml 在自动创建 Release 后调用，复用同一套构建步骤
 on:
   release:
     types: [published]
+  workflow_call:
+    inputs:
+      tag:
+        description: 要为其构建产物的 tag
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -14,7 +23,7 @@ jobs:
       - name: Checkout release tag
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -35,6 +44,12 @@ jobs:
         working-directory: apps/codex-plus-manager
         run: npm run vite:build
 
+      # 版本号跟随 tag：三处 manifest 都从 tag 派生，保证安装包名、二进制内嵌版本
+      # 与 Release 标题一致。必须放在任何 cargo build 之前。
+      - name: Stamp version from tag
+        shell: pwsh
+        run: node tools/version-stamp.mjs "${{ github.event.release.tag_name || inputs.tag }}"
+
       - name: Build binaries
         run: cargo build --release
 
@@ -48,14 +63,14 @@ jobs:
       - name: Build Windows zip asset
         shell: pwsh
         run: |
-          $version = "${{ github.event.release.tag_name }}".TrimStart("v", "V")
+          $version = "${{ github.event.release.tag_name || inputs.tag }}".TrimStart("v", "V")
           New-Item -ItemType Directory -Force dist/windows | Out-Null
           Compress-Archive -Path dist/windows/app/* -DestinationPath "dist/windows/CodexPlusPlus-$version-windows-x64.zip" -Force
 
       - name: Build Windows installer
         shell: pwsh
         run: |
-          $version = "${{ github.event.release.tag_name }}".TrimStart("v", "V")
+          $version = "${{ github.event.release.tag_name || inputs.tag }}".TrimStart("v", "V")
           $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
           if (-not (Test-Path $makensis)) {
             $makensis = "makensis"
@@ -67,7 +82,7 @@ jobs:
       - name: Upload Windows installer
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.release.tag_name }}
+          tag_name: ${{ github.event.release.tag_name || inputs.tag }}
           files: |
             dist/windows/*.exe
             dist/windows/*.zip
@@ -89,7 +104,7 @@ jobs:
       - name: Checkout release tag
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -108,6 +123,10 @@ jobs:
       - name: Build frontend
         working-directory: apps/codex-plus-manager
         run: npm run vite:build
+
+      # 版本号跟随 tag。macOS 与 Windows 各自独立构建，所以这里也要单独派生一次。
+      - name: Stamp version from tag
+        run: node tools/version-stamp.mjs "${{ github.event.release.tag_name || inputs.tag }}"
 
       - name: Build binaries
         run: cargo build --release --target ${{ matrix.target }}
@@ -145,7 +164,7 @@ jobs:
       - name: Upload macOS DMG
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.release.tag_name }}
+          tag_name: ${{ github.event.release.tag_name || inputs.tag }}
           files: |
             dist/macos/*.dmg
             dist/macos/*.zip
@@ -161,7 +180,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
         shell: bash
         run: |
           set -euo pipefail
@@ -190,7 +209,7 @@ jobs:
       - name: Upload latest.json
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
           REPO: ${{ github.repository }}
         shell: bash
         run: gh release upload "$TAG" latest.json --clobber --repo "$REPO"

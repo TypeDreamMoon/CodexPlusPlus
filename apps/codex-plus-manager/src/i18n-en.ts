@@ -676,6 +676,12 @@ export const EN_PLAIN: Record<string, string> = {
   "更多选项": "More options",
   "更新": "Update",
   "更新安装": "Update install",
+  "更新源": "Update source",
+  "自定义仓库": "Custom repository",
+  "例如 owner/repo，也可直接粘贴仓库地址":
+    "For example owner/repo, or paste the repository URL",
+  "仓库格式无效，检查更新将回退到上游。请填写 owner/repo 形式。":
+    "Invalid repository format; update checks fall back to upstream. Use owner/repo.",
   "最新版本": "Latest version",
   "最近启动": "Recent launches",
   "最近打开": "Recently opened",
@@ -1230,6 +1236,9 @@ export const EN_TEMPLATE: Record<string, string> = {
   "日志大小 {0}，仅显示末尾 {1} 行": "Log size {0}; showing only the last {1} lines",
   "市场 · {0}": "Marketplace · {0}",
   "当前版本 {0}": "Current version {0}",
+  "上游 {0}": "Upstream {0}",
+  "本 fork {0}": "This fork {0}",
+  "检查更新读取 {0} 的 latest.json。": "Update checks read latest.json from {0}.",
   "第 {0} 页": "Page {0}",
   "第 {0} 页，每页最多 {1} 条，按更新时间倒序显示": "Page {0}, up to {1} sessions per page, newest first",
   "打开选择器失败：{0}": "Failed to open the picker: {0}",

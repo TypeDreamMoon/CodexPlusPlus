@@ -309,7 +309,44 @@ type BackendSettings = {
   tools?: Record<string, ToolShard>;
   /** 顶栏当前聚焦的工具。只影响管理器的展示，不影响 Codex 的启动配置。 */
   activeTool?: string;
+  /** 更新源：上游 / 本 fork / 自定义仓库。 */
+  updateSource: UpdateSource;
+  /** `updateSource === "custom"` 时使用的仓库（owner/repo）。 */
+  updateSourceCustomRepo: string;
 };
+
+/** 更新源选项。`upstream` 跟随上游 Release，`fork` 跟随本 fork，`custom` 手填仓库。 */
+export type UpdateSource = "upstream" | "fork" | "custom";
+
+/** 上游仓库。与 Rust 侧 `update::DEFAULT_REPOSITORY` 保持一致。 */
+const UPSTREAM_UPDATE_REPO = "BigPizzaV3/CodexPlusPlus";
+/** 本 fork 仓库。与 Rust 侧 `update::FORK_REPOSITORY` 保持一致。 */
+const FORK_UPDATE_REPO = "TypeDreamMoon/CodexPlusPlus";
+
+/** 把用户填的仓库规整成 `owner/repo`；无法规整时返回空串。与 Rust 侧同规则。 */
+function normalizeRepoSlug(value: string): string {
+  let text = (value || "").trim();
+  if (!text) return "";
+  text = text.replace(/^https?:\/\//i, "").replace(/^www\./i, "").replace(/^github\.com\//i, "");
+  text = text.replace(/\/+$/, "").replace(/\.git$/i, "");
+  const parts = text.split("/");
+  if (parts.length !== 2) return "";
+  const [owner, repo] = parts.map((part) => part.trim());
+  if (!owner || !repo) return "";
+  const valid = (segment: string) => /^[A-Za-z0-9._-]+$/.test(segment);
+  return valid(owner) && valid(repo) ? `${owner}/${repo}` : "";
+}
+
+function isValidRepoSlug(value: string): boolean {
+  return normalizeRepoSlug(value) !== "";
+}
+
+/** 解析设置里的更新源，得到实际会被读取的仓库。与 Rust 侧 resolve_update_repository 同语义。 */
+function resolveUpdateRepo(source: UpdateSource, customRepo: string): string {
+  if (source === "fork") return FORK_UPDATE_REPO;
+  if (source === "custom") return normalizeRepoSlug(customRepo) || UPSTREAM_UPDATE_REPO;
+  return UPSTREAM_UPDATE_REPO;
+}
 
 /** settings.json 里单个工具的配置分片。Codex 分片由后端从扁平字段镜像生成。 */
 type ToolShard = {
@@ -1083,6 +1120,8 @@ const defaultSettings: BackendSettings = {
   relayTestModel: "gpt-5.4-mini",
   tools: {},
   activeTool: "codex",
+  updateSource: "upstream",
+  updateSourceCustomRepo: "",
 };
 
 export function App() {
@@ -2332,6 +2371,19 @@ export function App() {
     }
   };
 
+  /// 切换更新源：先落盘再重新检查。
+  ///
+  /// 不能只改表单 —— 用户切到「本 fork」就是想立刻看这个源的新版本，
+  /// 等到手动保存才生效会让人以为设置没起作用。
+  const changeUpdateSource = async (source: UpdateSource, customRepo: string) => {
+    const next = { ...settingsForm, updateSource: source, updateSourceCustomRepo: customRepo };
+    setSettingsForm(next);
+    // 自定义仓库还在输入中（或格式无效）时先不落盘，避免把半截仓库名写进设置。
+    if (source === "custom" && customRepo.trim() !== "" && !isValidRepoSlug(customRepo)) return;
+    const saved = await saveSettingsValue(next);
+    if (saved) await checkUpdate(true);
+  };
+
   const performUpdate = async () => {
     if (updateInstallProgress.active) return;
     const release =
@@ -3182,6 +3234,7 @@ export function App() {
       uninstallEntrypoints,
       repairShortcuts,
       checkUpdate,
+      changeUpdateSource,
       performUpdate,
       saveSettings,
       saveSettingsValue,
@@ -3595,6 +3648,8 @@ export function App() {
               updateInstallProgress={updateInstallProgress}
               logs={logs}
               diagnostics={diagnostics}
+              form={settingsForm}
+              onFormChange={setSettingsForm}
               actions={actions}
             />
           ) : null}
@@ -3697,6 +3752,7 @@ type Actions = {
   uninstallEntrypoints: () => Promise<void>;
   repairShortcuts: () => Promise<void>;
   checkUpdate: () => Promise<void>;
+  changeUpdateSource: (source: UpdateSource, customRepo: string) => Promise<void>;
   performUpdate: () => Promise<void>;
   saveSettings: () => Promise<void>;
   saveSettingsValue: (settings: BackendSettings, silent?: boolean) => Promise<BackendSettings | null>;
@@ -6461,6 +6517,8 @@ function AboutScreen({
   updateInstallProgress,
   logs,
   diagnostics,
+  form,
+  onFormChange,
   actions,
 }: {
   overview: OverviewResult | null;
@@ -6468,8 +6526,14 @@ function AboutScreen({
   updateInstallProgress: TaskProgress;
   logs: LogsResult | null;
   diagnostics: DiagnosticsResult | null;
+  form: BackendSettings;
+  onFormChange: (value: BackendSettings) => void;
   actions: Actions;
 }) {
+  const updateSource = normalizeUpdateSource(form.updateSource);
+  const resolvedRepo = resolveUpdateRepo(updateSource, form.updateSourceCustomRepo);
+  const customRepoInvalid =
+    updateSource === "custom" && form.updateSourceCustomRepo.trim() !== "" && !isValidRepoSlug(form.updateSourceCustomRepo);
   return (
     <>
       <Panel>
@@ -6503,6 +6567,34 @@ function AboutScreen({
       <Panel>
         <CardHead title={t("GitHub Release 更新")} detail={tf("当前版本 {0}", [overview?.current_version ?? update?.currentVersion ?? "-"])} />
         <CardContent>
+          {/* 更新源。默认跟随上游；fork 出来的构建要跟随自己的 Release，
+              所以这里必须可切换，否则永远只会发现上游的新版本。 */}
+          <Field label={t("更新源")}>
+            <AppSelect<UpdateSource>
+              onChange={(value) => void actions.changeUpdateSource(value, form.updateSourceCustomRepo)}
+              options={[
+                { value: "upstream", label: tf("上游 {0}", [UPSTREAM_UPDATE_REPO]) },
+                { value: "fork", label: tf("本 fork {0}", [FORK_UPDATE_REPO]) },
+                { value: "custom", label: t("自定义仓库") },
+              ]}
+              value={updateSource}
+            />
+          </Field>
+          {updateSource === "custom" ? (
+            <Field label={t("自定义仓库")}>
+              <Input
+                onBlur={(event) => void actions.changeUpdateSource("custom", event.currentTarget.value)}
+                onChange={(event) => onFormChange({ ...form, updateSourceCustomRepo: event.currentTarget.value })}
+                placeholder={t("例如 owner/repo，也可直接粘贴仓库地址")}
+                value={form.updateSourceCustomRepo}
+              />
+            </Field>
+          ) : null}
+          <p className="field-hint">
+            {customRepoInvalid
+              ? t("仓库格式无效，检查更新将回退到上游。请填写 owner/repo 形式。")
+              : tf("检查更新读取 {0} 的 latest.json。", [resolvedRepo])}
+          </p>
           <div className="metric-list">
             <Metric label={t("状态")} value={update?.status ?? "not_checked"} />
             <Metric label={t("最新版本")} value={update?.latestVersion ?? t("未检查")} />
@@ -10813,6 +10905,8 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
   return syncLegacyRelayFields({
     ...defaultSettings,
     ...settings,
+    updateSource: normalizeUpdateSource(settings.updateSource),
+    updateSourceCustomRepo: (settings.updateSourceCustomRepo || "").trim(),
     relayProfilesEnabled: settings.relayProfilesEnabled !== false,
     codexAppImageOverlayOpacity: clampNumber(settings.codexAppImageOverlayOpacity || 35, 1, 100),
     codexAppImageOverlayFitMode: normalizeImageOverlayFitMode(settings.codexAppImageOverlayFitMode),
@@ -10830,6 +10924,10 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
     relayProfiles: profiles,
     activeRelayId,
   });
+}
+
+function normalizeUpdateSource(value: UpdateSource | undefined): UpdateSource {
+  return value === "fork" || value === "custom" ? value : "upstream";
 }
 
 function normalizeStepwiseProtocol(value: StepwiseProtocol | undefined): StepwiseProtocol {

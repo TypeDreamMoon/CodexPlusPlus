@@ -5,8 +5,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const DEFAULT_REPOSITORY: &str = "BigPizzaV3/CodexPlusPlus";
+/// 本 fork 的仓库。`updateSource = "fork"` 时使用它，
+/// 这样用户不必手填仓库名就能跟随自己的 Release。
+pub const FORK_REPOSITORY: &str = "TypeDreamMoon/CodexPlusPlus";
 pub const DEFAULT_LATEST_JSON_URL: &str =
     "https://github.com/BigPizzaV3/CodexPlusPlus/releases/latest/download/latest.json";
+/// 更新源：跟随上游 Release（默认）。
+pub const UPDATE_SOURCE_UPSTREAM: &str = "upstream";
+/// 更新源：跟随本 fork 自己的 Release。
+pub const UPDATE_SOURCE_FORK: &str = "fork";
+/// 更新源：使用 `updateSourceCustomRepo` 指定的任意 `owner/repo`。
+pub const UPDATE_SOURCE_CUSTOM: &str = "custom";
 const UPDATE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const UPDATE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -183,7 +192,109 @@ pub async fn fetch_latest_release(latest_json_url: &str) -> anyhow::Result<Relea
 }
 
 pub async fn check_for_update(current_version: &str) -> anyhow::Result<UpdateCheck> {
-    let release = fetch_latest_release(DEFAULT_LATEST_JSON_URL).await?;
+    check_for_update_from(current_version, DEFAULT_REPOSITORY).await
+}
+
+/// 把用户填的仓库规整成 `owner/repo`。
+///
+/// 用户很可能直接粘贴 GitHub 地址，所以这里接受带协议、带 `www.`、
+/// 带 `.git` 后缀、带尾斜杠以及 `github.com/` 前缀的写法。
+pub fn normalize_repository(value: &str) -> Option<String> {
+    let mut text = value.trim();
+    if text.is_empty() {
+        return None;
+    }
+    for prefix in ["https://", "http://"] {
+        if let Some(rest) = text.strip_prefix(prefix) {
+            text = rest;
+            break;
+        }
+    }
+    if let Some(rest) = text.strip_prefix("www.") {
+        text = rest;
+    }
+    if let Some(rest) = text.strip_prefix("github.com/") {
+        text = rest;
+    }
+    let text = text.trim_end_matches('/').trim_end_matches(".git");
+    let mut parts = text.split('/');
+    let owner = parts.next().unwrap_or_default().trim();
+    let repo = parts.next().unwrap_or_default().trim();
+    if parts.next().is_some() || owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    // owner/repo 只允许字母、数字、`.`、`-`、`_`，避免把任意字符串拼进 URL。
+    let valid = |segment: &str| {
+        segment
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_'))
+    };
+    if !valid(owner) || !valid(repo) {
+        return None;
+    }
+    Some(format!("{owner}/{repo}"))
+}
+
+/// 解析「更新源」设置为实际使用的仓库。
+///
+/// - `upstream`（默认）：上游仓库
+/// - `fork`：本项目所属的 fork
+/// - `custom`：`custom_repo` 指定的 `owner/repo`；填了但格式不合法则回退到上游，
+///   保证更新检查不会因为一个手滑的仓库名而彻底不可用。
+pub fn resolve_update_repository(source: &str, custom_repo: &str) -> String {
+    match source.trim().to_ascii_lowercase().as_str() {
+        UPDATE_SOURCE_FORK => FORK_REPOSITORY.to_string(),
+        UPDATE_SOURCE_CUSTOM => {
+            normalize_repository(custom_repo).unwrap_or_else(|| DEFAULT_REPOSITORY.to_string())
+        }
+        _ => DEFAULT_REPOSITORY.to_string(),
+    }
+}
+
+pub fn latest_json_url_for_repository(repository: &str) -> String {
+    format!("https://github.com/{repository}/releases/latest/download/latest.json")
+}
+
+/// 按顺序尝试的 latest.json 地址。
+///
+/// 选中 fork 或自定义仓库时，优先读它自己的 Release；只有当它还没有可用
+/// 的 latest.json（例如刚 fork、尚未发过 Release）才回退到上游，避免更新
+/// 检查直接变成不可用。
+pub fn latest_json_candidates(source: &str, custom_repo: &str) -> Vec<String> {
+    let primary = resolve_update_repository(source, custom_repo);
+    let mut urls = vec![latest_json_url_for_repository(&primary)];
+    if primary != DEFAULT_REPOSITORY {
+        urls.push(DEFAULT_LATEST_JSON_URL.to_string());
+    }
+    urls
+}
+
+/// 从指定仓库检查更新。
+pub async fn check_for_update_from(
+    current_version: &str,
+    repository: &str,
+) -> anyhow::Result<UpdateCheck> {
+    let release = fetch_latest_release(&latest_json_url_for_repository(repository)).await?;
+    build_update_check(release, current_version)
+}
+
+/// 按更新源设置检查更新，依次尝试候选地址。
+pub async fn check_for_update_with_source(
+    current_version: &str,
+    source: &str,
+    custom_repo: &str,
+) -> anyhow::Result<UpdateCheck> {
+    let mut last_error = None;
+    for url in latest_json_candidates(source, custom_repo) {
+        match fetch_latest_release(&url).await {
+            Ok(release) => return build_update_check(release, current_version),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no update source available")))
+}
+
+fn build_update_check(release: Release, current_version: &str) -> anyhow::Result<UpdateCheck> {
     let update_available = is_newer_version(&release.version, current_version)?;
     Ok(UpdateCheck {
         current_version: current_version.to_string(),

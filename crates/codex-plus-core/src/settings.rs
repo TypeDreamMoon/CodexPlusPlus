@@ -583,6 +583,14 @@ pub struct BackendSettings {
     /// UI 顶栏当前聚焦的工具。只影响管理器的展示，不影响 Codex 的启动配置。
     #[serde(rename = "activeTool", default)]
     pub active_tool: ToolId,
+    /// 更新源。决定「检查更新」读哪个仓库的 Release：
+    /// `upstream`（默认，上游 BigPizzaV3）、`fork` 或 `custom`。
+    /// fork 场景下用户希望跟随自己的构建，所以这里必须可切换。
+    #[serde(rename = "updateSource", default = "default_update_source")]
+    pub update_source: String,
+    /// `updateSource = "custom"` 时使用的仓库，格式 `owner/repo`。
+    #[serde(rename = "updateSourceCustomRepo", default)]
+    pub update_source_custom_repo: String,
 }
 
 impl Default for BackendSettings {
@@ -662,6 +670,8 @@ impl Default for BackendSettings {
             relay_test_model: default_relay_test_model(),
             tools: BTreeMap::new(),
             active_tool: ToolId::Codex,
+            update_source: default_update_source(),
+            update_source_custom_repo: String::new(),
         }
     }
 }
@@ -1035,6 +1045,10 @@ pub fn default_active_relay_id() -> String {
 
 pub fn default_relay_test_model() -> String {
     "gpt-5.4-mini".to_string()
+}
+
+pub fn default_update_source() -> String {
+    crate::update::UPDATE_SOURCE_UPSTREAM.to_string()
 }
 
 pub fn default_relay_profiles() -> Vec<RelayProfile> {

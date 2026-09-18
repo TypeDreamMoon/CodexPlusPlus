@@ -4077,7 +4077,15 @@ fn count_skill_files(root: &Path) -> std::io::Result<usize> {
 
 #[tauri::command]
 pub async fn check_update() -> CommandResult<Value> {
-    match codex_plus_core::update::check_for_update(codex_plus_core::version::VERSION).await {
+    // 更新源可在设置里切换（上游 / 本 fork / 自定义仓库），所以每次检查都读一遍设置。
+    let settings = SettingsStore::default().load().unwrap_or_default();
+    match codex_plus_core::update::check_for_update_with_source(
+        codex_plus_core::version::VERSION,
+        &settings.update_source,
+        &settings.update_source_custom_repo,
+    )
+    .await
+    {
         Ok(update) => {
             let status = if update.update_available {
                 "ok"

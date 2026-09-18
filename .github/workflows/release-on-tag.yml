@@ -1,0 +1,108 @@
+name: Release on tag
+
+# 推一个版本 tag 就自动发 Release。
+#
+#   git tag v1.4.0 && git push origin v1.4.0
+#
+# 这里只负责「建 Release + 写更新说明」；各个平台的安装包由 release-assets.yml
+# 构建并作为附件上传 —— 复用同一个 workflow，避免两套构建逻辑漂移。
+#
+# 版本号的唯一真源就是这个 tag：release-assets.yml 在编译前用
+# tools/version-stamp.mjs 把版本写进 Cargo.toml / package.json / tauri.conf.json，
+# 所以安装包名、二进制内嵌版本、Release 标题三者一定一致。
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Checkout tagged commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          set -euo pipefail
+          echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Build release notes
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require("fs");
+          const tag = process.env.TAG;
+          const version = tag.replace(/^v/i, "");
+          const lines = [];
+          lines.push(`Codex++ ${version}`);
+          lines.push("");
+          // 有 CHANGELOG 就取该版本对应的段落，没有则退回 commit 列表。
+          let body = "";
+          try {
+            const changelog = fs.readFileSync("CHANGELOG.md", "utf8");
+            const heading = new RegExp(`^#{1,3}\\s*\\[?v?${version.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}\\]?.*$`, "m");
+            const match = heading.exec(changelog);
+            if (match) {
+              const rest = changelog.slice(match.index + match[0].length);
+              const nextHeading = rest.search(/^#{1,3}\s/m);
+              body = (nextHeading === -1 ? rest : rest.slice(0, nextHeading)).trim();
+            }
+          } catch {
+            body = "";
+          }
+          if (!body) {
+            body = `本版本由 tag \`${tag}\` 自动发布。`;
+          }
+          lines.push(body);
+          lines.push("");
+          lines.push("### 安装包");
+          lines.push("");
+          lines.push("- Windows：`CodexPlusPlus-" + version + "-windows-x64-setup.exe`");
+          lines.push("- macOS Intel：`CodexPlusPlus-" + version + "-macos-x64.dmg`");
+          lines.push("- macOS Apple Silicon：`CodexPlusPlus-" + version + "-macos-arm64.dmg`");
+          lines.push("");
+          lines.push("> 安装包由 CI 在本 Release 上构建并附加，可能需要几分钟才会全部出现。");
+          fs.writeFileSync("release-notes.md", lines.join("\n") + "\n");
+          NODE
+          cat release-notes.md
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # 已存在同名 Release 时不失败：tag 被重推（例如修改后 force push）应当
+          # 复用同一个 Release，而不是让整个工作流红掉。
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME 已存在，改为更新说明。"
+            gh release edit "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$GITHUB_REF_NAME" \
+              --notes-file release-notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$GITHUB_REF_NAME" \
+              --notes-file release-notes.md \
+              --verify-tag
+          fi
+
+  build-assets:
+    needs: create-release
+    # 复用发布资产的构建逻辑；它自己声明了 contents: write。
+    uses: ./.github/workflows/release-assets.yml
+    with:
+      tag: ${{ needs.create-release.outputs.tag }}
