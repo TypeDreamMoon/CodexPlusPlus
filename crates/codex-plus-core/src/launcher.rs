@@ -818,6 +818,16 @@ impl LaunchHooks for DefaultLaunchHooks {
     }
 
     async fn start_helper(&self, helper_port: u16) -> anyhow::Result<()> {
+        // 请求体上限在这里定一次：之后 helper 生命周期内不再变更。
+        // 设置优先，环境变量可以再覆盖（便于不便改 settings.json 的场景）。
+        let settings = crate::settings::SettingsStore::default()
+            .load()
+            .unwrap_or_default();
+        let limits = resolve_http_body_limits(
+            settings.codex_plus_max_http_body_mb,
+            settings.codex_plus_max_http_encoded_body_mb,
+        );
+        configure_http_body_limits(limits);
         let bind_host = helper_bind_host();
         let listener = tokio::net::TcpListener::bind((bind_host.as_str(), helper_port))
             .await
@@ -1161,7 +1171,8 @@ async fn handle_helper_connection(
     mut stream: tokio::net::TcpStream,
     remote_addr: Option<SocketAddr>,
 ) -> anyhow::Result<()> {
-    let request = match read_http_request(&mut stream).await {
+    let limits = http_body_limits();
+    let request = match read_http_request(&mut stream, limits).await {
         Ok(request) => request,
         Err(error) => {
             let body = serde_json::to_vec(&serde_json::json!({
@@ -1268,6 +1279,7 @@ async fn handle_helper_connection(
         let request_body = match decode_protocol_proxy_request_body(
             &request.body,
             request_content_encoding.as_deref(),
+            limits,
         ) {
             Ok(body) => body,
             Err(error) => {
@@ -1432,17 +1444,23 @@ async fn handle_helper_connection(
 fn decode_protocol_proxy_request_body(
     body: &[u8],
     content_encoding: Option<&str>,
+    limits: HttpBodyLimits,
 ) -> anyhow::Result<String> {
     let encoding = content_encoding.unwrap_or_default().trim();
     let decoded = if encoding.is_empty() || encoding.eq_ignore_ascii_case("identity") {
         body.to_vec()
     } else if encoding.eq_ignore_ascii_case("zstd") {
         let decoder = zstd::stream::read::Decoder::new(std::io::Cursor::new(body))?;
-        let mut limited = decoder.take((MAX_HTTP_BODY_BYTES + 1) as u64);
+        // 解压炸弹防护：最多只读到上限 + 1 字节，多出来的那 1 字节用来判定超限。
+        let mut limited = decoder.take((limits.max_decoded as u64).saturating_add(1));
         let mut decoded = Vec::new();
         limited.read_to_end(&mut decoded)?;
-        if decoded.len() > MAX_HTTP_BODY_BYTES {
-            anyhow::bail!("解压后的请求体超过大小限制");
+        if limits.exceeds_decoded(decoded.len()) {
+            anyhow::bail!(
+                "解压后的请求体超过大小限制（{}；可通过 settings.json 的 \
+                 codexPlusMaxHttpBodyMb 或环境变量 {MAX_HTTP_BODY_BYTES_ENV} 调大）",
+                format_mib(limits.max_decoded),
+            );
         }
         decoded
     } else {
@@ -2089,8 +2107,122 @@ mod computer_use_tests {
 }
 
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
-const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
-const MAX_HTTP_ENCODED_BODY_BYTES: usize = 64 * 1024 * 1024;
+/// 解压后请求体的默认上限（32 MiB）。用户可用 settings 字段或环境变量调大。
+pub const DEFAULT_MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
+/// 压缩前请求体的默认上限（64 MiB），是解压后上限的两倍。
+pub const DEFAULT_MAX_HTTP_ENCODED_BODY_BYTES: usize = 64 * 1024 * 1024;
+/// 环境变量覆盖：便于不便改 settings.json 的场景（例如直接跑 launcher）。
+pub const MAX_HTTP_BODY_BYTES_ENV: &str = "CODEX_PLUS_MAX_HTTP_BODY_BYTES";
+pub const MAX_HTTP_ENCODED_BODY_BYTES_ENV: &str = "CODEX_PLUS_MAX_HTTP_ENCODED_BODY_BYTES";
+const MIB: usize = 1024 * 1024;
+/// 上限的合理天花板（1 GiB）。再往上既没有实际意义，也会让
+/// 「解压后上限 × 2」溢出到荒唐的量级。
+const MAX_CONFIGURABLE_BODY_BYTES: usize = 1024 * MIB;
+
+/// helper 接受请求体的大小上限。
+///
+/// 原来这两个值是硬编码常量：请求体一旦超过 32 MiB 就直接 413，且用户侧
+/// 没有任何办法调大（见上游 issue #2198）。现在改成可配置，默认值不变。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpBodyLimits {
+    /// 解压后的请求体上限。
+    pub max_decoded: usize,
+    /// 压缩前的请求体上限（Content-Encoding 之后、解压之前的字节数）。
+    pub max_encoded: usize,
+}
+
+impl Default for HttpBodyLimits {
+    fn default() -> Self {
+        Self {
+            max_decoded: DEFAULT_MAX_HTTP_BODY_BYTES,
+            max_encoded: DEFAULT_MAX_HTTP_ENCODED_BODY_BYTES,
+        }
+    }
+}
+
+impl HttpBodyLimits {
+    /// 从设置字段（单位 MiB）构造。0 或缺省表示沿用默认值。
+    ///
+    /// 压缩前上限未单独配置时取「解压后上限 × 2」，与默认值的 32→64 MiB
+    /// 关系保持一致；否则会出现「解压后调到 128 MiB、压缩前仍卡在 64 MiB」
+    /// 这种自相矛盾的组合。
+    pub fn from_settings(max_body_mb: u32, max_encoded_mb: u32) -> Self {
+        let decoded = mb_to_bytes(max_body_mb).unwrap_or(DEFAULT_MAX_HTTP_BODY_BYTES);
+        let encoded = mb_to_bytes(max_encoded_mb)
+            .unwrap_or_else(|| decoded.saturating_mul(2))
+            .min(MAX_CONFIGURABLE_BODY_BYTES);
+        Self {
+            max_decoded: decoded,
+            max_encoded: encoded.max(decoded),
+        }
+    }
+
+    /// 环境变量优先于设置：`CODEX_PLUS_MAX_HTTP_BODY_BYTES` /
+    /// `CODEX_PLUS_MAX_HTTP_ENCODED_BODY_BYTES`（单位字节）。
+    pub fn with_env_overrides(self) -> Self {
+        let decoded = env_bytes(MAX_HTTP_BODY_BYTES_ENV).unwrap_or(self.max_decoded);
+        let encoded = env_bytes(MAX_HTTP_ENCODED_BODY_BYTES_ENV)
+            .unwrap_or_else(|| self.max_encoded.max(self.max_decoded));
+        Self {
+            max_decoded: decoded,
+            max_encoded: encoded.max(decoded),
+        }
+    }
+
+    fn too_large(&self) -> HttpRequestReadError {
+        HttpRequestReadError::payload_too_large(self.max_decoded)
+    }
+
+    fn exceeds_decoded(&self, length: usize) -> bool {
+        length > self.max_decoded
+    }
+
+    fn exceeds_encoded(&self, length: usize) -> bool {
+        length > self.max_encoded
+    }
+}
+
+/// MiB 转字节；0、溢出或超过天花板时为 None（调用方回退默认值）。
+fn mb_to_bytes(mb: u32) -> Option<usize> {
+    if mb == 0 {
+        return None;
+    }
+    let bytes = usize::try_from(mb).ok()?.checked_mul(MIB)?;
+    (bytes <= MAX_CONFIGURABLE_BODY_BYTES).then_some(bytes)
+}
+
+fn env_bytes(name: &str) -> Option<usize> {
+    let raw = std::env::var(name).ok()?;
+    let parsed = raw.trim().parse::<usize>().ok()?;
+    (parsed > 0).then_some(parsed)
+}
+
+fn format_mib(bytes: usize) -> String {
+    if bytes % MIB == 0 {
+        format!("{} MiB", bytes / MIB)
+    } else {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    }
+}
+
+static HTTP_BODY_LIMITS: std::sync::OnceLock<HttpBodyLimits> = std::sync::OnceLock::new();
+
+/// 进程级上限。launcher 启动 helper 前用 `configure_http_body_limits` 写入；
+/// 未配置时（测试、直接调用）取默认值。
+fn http_body_limits() -> HttpBodyLimits {
+    *HTTP_BODY_LIMITS.get_or_init(HttpBodyLimits::default)
+}
+
+/// 写入进程级请求体上限。重复调用只有第一次生效（OnceLock 语义），
+/// 这与 helper 生命周期一致：helper 起来后不再变更。
+pub fn configure_http_body_limits(limits: HttpBodyLimits) {
+    let _ = HTTP_BODY_LIMITS.set(limits);
+}
+
+/// 从 settings 与环境变量解析请求体上限。启动 helper 时调用一次。
+pub fn resolve_http_body_limits(max_body_mb: u32, max_encoded_mb: u32) -> HttpBodyLimits {
+    HttpBodyLimits::from_settings(max_body_mb, max_encoded_mb).with_env_overrides()
+}
 
 struct HttpRequest {
     headers: Vec<u8>,
@@ -2111,10 +2243,15 @@ impl HttpRequestReadError {
         }
     }
 
-    fn payload_too_large() -> Self {
+    fn payload_too_large(limit: usize) -> Self {
         Self {
             status: "413 Payload Too Large",
-            message: format!("HTTP 请求体超过 {MAX_HTTP_BODY_BYTES} 字节限制"),
+            message: format!(
+                "HTTP 请求体超过 {} 字节限制（{}；可通过 settings.json 的 \
+                 codexPlusMaxHttpBodyMb 或环境变量 {MAX_HTTP_BODY_BYTES_ENV} 调大）",
+                limit,
+                format_mib(limit),
+            ),
         }
     }
 
@@ -2161,9 +2298,16 @@ struct ChunkedScanState {
     position: usize,
     decoded_len: usize,
     complete: bool,
+    limits: HttpBodyLimits,
 }
 
 impl ChunkedScanState {
+    fn new(limits: HttpBodyLimits) -> Self {
+        Self {
+            limits,
+            ..Self::default()
+        }
+    }
     fn advance(&mut self, encoded: &[u8]) -> Result<ChunkedBodyScan, HttpRequestReadError> {
         if self.complete {
             return Ok(ChunkedBodyScan::Complete);
@@ -2216,13 +2360,13 @@ impl ChunkedScanState {
             let next_decoded_len = self
                 .decoded_len
                 .checked_add(chunk_size)
-                .ok_or_else(HttpRequestReadError::payload_too_large)?;
-            if next_decoded_len > MAX_HTTP_BODY_BYTES {
-                return Err(HttpRequestReadError::payload_too_large());
+                .ok_or_else(|| self.limits.too_large())?;
+            if self.limits.exceeds_decoded(next_decoded_len) {
+                return Err(self.limits.too_large());
             }
             let chunk_end = data_start
                 .checked_add(chunk_size)
-                .ok_or_else(HttpRequestReadError::payload_too_large)?;
+                .ok_or_else(|| self.limits.too_large())?;
             if encoded.len() < chunk_end + 2 {
                 return Ok(ChunkedBodyScan::Incomplete);
             }
@@ -2237,12 +2381,13 @@ impl ChunkedScanState {
 
 async fn read_http_request(
     stream: &mut tokio::net::TcpStream,
+    limits: HttpBodyLimits,
 ) -> Result<HttpRequest, HttpRequestReadError> {
     let mut buffer = Vec::new();
     let mut chunk = vec![0_u8; 4096];
     let mut header_end = None;
     let mut framing = HttpBodyFraming::Empty;
-    let mut chunked_scan = ChunkedScanState::default();
+    let mut chunked_scan = ChunkedScanState::new(limits);
 
     loop {
         let read = stream.read(&mut chunk).await?;
@@ -2263,14 +2408,14 @@ async fn read_http_request(
         }
         if let Some(end) = header_end {
             let body = &buffer[end + 4..];
-            if body.len() > MAX_HTTP_ENCODED_BODY_BYTES {
-                return Err(HttpRequestReadError::payload_too_large());
+            if limits.exceeds_encoded(body.len()) {
+                return Err(limits.too_large());
             }
             match framing {
                 HttpBodyFraming::Empty => break,
                 HttpBodyFraming::ContentLength(content_length) => {
-                    if content_length > MAX_HTTP_BODY_BYTES {
-                        return Err(HttpRequestReadError::payload_too_large());
+                    if limits.exceeds_decoded(content_length) {
+                        return Err(limits.too_large());
                     }
                     if body.len() >= content_length {
                         break;
@@ -2291,9 +2436,9 @@ async fn read_http_request(
     let body = match framing {
         HttpBodyFraming::Empty => Vec::new(),
         HttpBodyFraming::ContentLength(content_length) => {
-            content_length_body(encoded_body, content_length)?
+            content_length_body(encoded_body, content_length, limits)?
         }
-        HttpBodyFraming::Chunked => match decode_chunked_body(encoded_body)? {
+        HttpBodyFraming::Chunked => match decode_chunked_body(encoded_body, limits)? {
             ChunkedBody::Complete(body) => body,
             ChunkedBody::Incomplete => {
                 return Err(HttpRequestReadError::bad_request(
@@ -2361,9 +2506,10 @@ fn http_body_framing(headers: &[u8]) -> Result<HttpBodyFraming, HttpRequestReadE
 fn content_length_body(
     encoded: &[u8],
     content_length: usize,
+    limits: HttpBodyLimits,
 ) -> Result<Vec<u8>, HttpRequestReadError> {
-    if content_length > MAX_HTTP_BODY_BYTES {
-        return Err(HttpRequestReadError::payload_too_large());
+    if limits.exceeds_decoded(content_length) {
+        return Err(limits.too_large());
     }
     if encoded.len() < content_length {
         return Err(HttpRequestReadError::bad_request("HTTP 请求体不完整"));
@@ -2371,7 +2517,10 @@ fn content_length_body(
     Ok(encoded[..content_length].to_vec())
 }
 
-fn decode_chunked_body(encoded: &[u8]) -> Result<ChunkedBody, HttpRequestReadError> {
+fn decode_chunked_body(
+    encoded: &[u8],
+    limits: HttpBodyLimits,
+) -> Result<ChunkedBody, HttpRequestReadError> {
     let mut decoded = Vec::new();
     let mut position = 0;
     loop {
@@ -2415,12 +2564,12 @@ fn decode_chunked_body(encoded: &[u8]) -> Result<ChunkedBody, HttpRequestReadErr
                 position += trailer_end_offset + 2;
             }
         }
-        if decoded.len().saturating_add(chunk_size) > MAX_HTTP_BODY_BYTES {
-            return Err(HttpRequestReadError::payload_too_large());
+        if limits.exceeds_decoded(decoded.len().saturating_add(chunk_size)) {
+            return Err(limits.too_large());
         }
         let chunk_end = position
             .checked_add(chunk_size)
-            .ok_or_else(HttpRequestReadError::payload_too_large)?;
+            .ok_or_else(|| limits.too_large())?;
         if encoded.len() < chunk_end + 2 {
             return Ok(ChunkedBody::Incomplete);
         }
@@ -2434,7 +2583,7 @@ fn decode_chunked_body(encoded: &[u8]) -> Result<ChunkedBody, HttpRequestReadErr
 
 #[cfg(test)]
 fn scan_chunked_body(encoded: &[u8]) -> Result<ChunkedBodyScan, HttpRequestReadError> {
-    ChunkedScanState::default().advance(encoded)
+    ChunkedScanState::new(HttpBodyLimits::default()).advance(encoded)
 }
 
 fn header_value_from_headers(headers: &str, header_name: &str) -> Option<String> {
@@ -3430,16 +3579,18 @@ mod tests {
 
     #[test]
     fn chunked_decoder_accepts_exact_body_limit_and_rejects_one_byte_more() {
-        let mut exact = format!("{:X}\r\n", MAX_HTTP_BODY_BYTES).into_bytes();
-        exact.resize(exact.len() + MAX_HTTP_BODY_BYTES, b'a');
+        let limits = HttpBodyLimits::default();
+        let max = limits.max_decoded;
+        let mut exact = format!("{:X}\r\n", max).into_bytes();
+        exact.resize(exact.len() + max, b'a');
         exact.extend_from_slice(b"\r\n0\r\n\r\n");
-        let ChunkedBody::Complete(decoded) = decode_chunked_body(&exact).unwrap() else {
+        let ChunkedBody::Complete(decoded) = decode_chunked_body(&exact, limits).unwrap() else {
             panic!("expected complete chunked body");
         };
-        assert_eq!(decoded.len(), MAX_HTTP_BODY_BYTES);
+        assert_eq!(decoded.len(), max);
 
-        let oversized = format!("{:X}\r\n", MAX_HTTP_BODY_BYTES + 1).into_bytes();
-        let error = decode_chunked_body(&oversized).unwrap_err();
+        let oversized = format!("{:X}\r\n", max + 1).into_bytes();
+        let error = decode_chunked_body(&oversized, limits).unwrap_err();
         assert_eq!(error.status(), "413 Payload Too Large");
     }
 
@@ -3457,7 +3608,9 @@ mod tests {
             scan_chunked_body(encoded).unwrap(),
             ChunkedBodyScan::Complete
         ));
-        let ChunkedBody::Complete(decoded) = decode_chunked_body(encoded).unwrap() else {
+        let ChunkedBody::Complete(decoded) =
+            decode_chunked_body(encoded, HttpBodyLimits::default()).unwrap()
+        else {
             panic!("expected complete chunked body");
         };
         assert_eq!(decoded, [0x00, 0x80, 0xff, b'A', b'B']);
@@ -3477,15 +3630,15 @@ mod tests {
 
     #[test]
     fn content_length_body_accepts_exact_limit_and_rejects_one_byte_more() {
-        let exact = vec![b'a'; MAX_HTTP_BODY_BYTES];
+        let limits = HttpBodyLimits::default();
+        let max = limits.max_decoded;
+        let exact = vec![b'a'; max];
         assert_eq!(
-            content_length_body(&exact, MAX_HTTP_BODY_BYTES)
-                .unwrap()
-                .len(),
-            MAX_HTTP_BODY_BYTES
+            content_length_body(&exact, max, limits).unwrap().len(),
+            max
         );
 
-        let error = content_length_body(&[], MAX_HTTP_BODY_BYTES + 1).unwrap_err();
+        let error = content_length_body(&[], max + 1, limits).unwrap_err();
         assert_eq!(error.status(), "413 Payload Too Large");
     }
 
@@ -3503,11 +3656,16 @@ mod tests {
     async fn helper_returns_413_before_reading_oversized_content_length_body() {
         let request = format!(
             "POST /v1/audio/transcriptions HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=x\r\nContent-Length: {}\r\n\r\n",
-            MAX_HTTP_BODY_BYTES + 1
+            DEFAULT_MAX_HTTP_BODY_BYTES + 1
         );
         let response = send_raw_helper_request(request.as_bytes()).await;
 
-        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 413 Payload Too Large"));
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 413 Payload Too Large"));
+        // 报错要能自己指向调大的办法，否则用户只知道被拒、不知道怎么办（issue #2198）。
+        assert!(text.contains("codexPlusMaxHttpBodyMb"), "缺少 settings 字段提示");
+        assert!(text.contains(MAX_HTTP_BODY_BYTES_ENV), "缺少环境变量提示");
+        assert!(text.contains("32 MiB"), "缺少可读的上限值：{text}");
     }
 
     #[tokio::test]
@@ -3568,7 +3726,9 @@ mod tests {
         std::fs::write(settings_path, serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
         let upstream = tokio::spawn(async move {
             let (mut stream, _) = upstream_listener.accept().await.unwrap();
-            let request = read_http_request(&mut stream).await.unwrap();
+            let request = read_http_request(&mut stream, HttpBodyLimits::default())
+                .await
+                .unwrap();
             let body = br#"{"error":{"message":"rate limited"}}"#;
             let response = format!(
                 "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/problem+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -3604,10 +3764,15 @@ mod tests {
         let body = br#"{"model":"gpt-5.6-sol","input":"probe","stream":false}"#;
         let compressed = zstd::stream::encode_all(std::io::Cursor::new(body), 3).unwrap();
 
-        let decoded = decode_protocol_proxy_request_body(&compressed, Some("zstd")).unwrap();
+        let decoded =
+            decode_protocol_proxy_request_body(&compressed, Some("zstd"), HttpBodyLimits::default())
+                .unwrap();
 
         assert_eq!(decoded.as_bytes(), body);
-        assert!(decode_protocol_proxy_request_body(body, Some("gzip")).is_err());
+        assert!(
+            decode_protocol_proxy_request_body(body, Some("gzip"), HttpBodyLimits::default())
+                .is_err()
+        );
     }
 
     #[tokio::test]

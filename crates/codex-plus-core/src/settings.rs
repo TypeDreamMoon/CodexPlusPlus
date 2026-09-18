@@ -591,6 +591,15 @@ pub struct BackendSettings {
     /// `updateSource = "custom"` 时使用的仓库，格式 `owner/repo`。
     #[serde(rename = "updateSourceCustomRepo", default)]
     pub update_source_custom_repo: String,
+    /// helper 端口接受的最大解压后请求体，单位 MiB。
+    ///
+    /// 长会话叠多图时请求体很容易超过原来的硬编码 32 MiB，而下游网关调大也没用
+    /// —— 请求先在 helper 这层被 413 拦下。默认 0 表示沿用 32 MiB，保持原行为。
+    #[serde(rename = "codexPlusMaxHttpBodyMb", default)]
+    pub codex_plus_max_http_body_mb: u32,
+    /// helper 端口接受的最大压缩前请求体，单位 MiB。默认 0 表示沿用 64 MiB。
+    #[serde(rename = "codexPlusMaxHttpEncodedBodyMb", default)]
+    pub codex_plus_max_http_encoded_body_mb: u32,
 }
 
 impl Default for BackendSettings {
@@ -672,6 +681,8 @@ impl Default for BackendSettings {
             active_tool: ToolId::Codex,
             update_source: default_update_source(),
             update_source_custom_repo: String::new(),
+            codex_plus_max_http_body_mb: 0,
+            codex_plus_max_http_encoded_body_mb: 0,
         }
     }
 }

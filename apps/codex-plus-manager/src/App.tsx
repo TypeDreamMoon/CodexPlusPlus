@@ -313,6 +313,10 @@ type BackendSettings = {
   updateSource: UpdateSource;
   /** `updateSource === "custom"` 时使用的仓库（owner/repo）。 */
   updateSourceCustomRepo: string;
+  /** helper 接受的解压后请求体上限，单位 MiB；0 表示沿用默认 32 MiB。 */
+  codexPlusMaxHttpBodyMb: number;
+  /** helper 接受的压缩前请求体上限，单位 MiB；0 表示沿用默认 64 MiB。 */
+  codexPlusMaxHttpEncodedBodyMb: number;
 };
 
 /** 更新源选项。`upstream` 跟随上游 Release，`fork` 跟随本 fork，`custom` 手填仓库。 */
@@ -1122,6 +1126,8 @@ const defaultSettings: BackendSettings = {
   activeTool: "codex",
   updateSource: "upstream",
   updateSourceCustomRepo: "",
+  codexPlusMaxHttpBodyMb: 0,
+  codexPlusMaxHttpEncodedBodyMb: 0,
 };
 
 export function App() {
@@ -6881,6 +6887,50 @@ function SettingsScreen({
               <p className="field-hint">{t("每行一个参数，例如 --force_high_performance_gpu。不需要填写 open 或 --args。")}</p>
             </CardContent>
           </Panel>
+
+          <Panel>
+            <CardHead title={t("请求体大小上限")} detail={t("helper 端口转发 /v1/responses 时接受的请求体上限")} />
+            <CardContent className="settings-content">
+              <div className="form-row">
+                <Field label={t("解压后上限（MiB）")}>
+                  <Input
+                    max={1024}
+                    min={0}
+                    placeholder="32"
+                    type="number"
+                    value={form.codexPlusMaxHttpBodyMb}
+                    onChange={(event) =>
+                      onFormChange({
+                        ...form,
+                        codexPlusMaxHttpBodyMb: clampNumber(Number(event.currentTarget.value), 0, 1024),
+                      })
+                    }
+                  />
+                </Field>
+                <Field label={t("压缩前上限（MiB）")}>
+                  <Input
+                    max={1024}
+                    min={0}
+                    placeholder={t("默认 2 倍解压后上限")}
+                    type="number"
+                    value={form.codexPlusMaxHttpEncodedBodyMb}
+                    onChange={(event) =>
+                      onFormChange({
+                        ...form,
+                        codexPlusMaxHttpEncodedBodyMb: clampNumber(Number(event.currentTarget.value), 0, 1024),
+                      })
+                    }
+                  />
+                </Field>
+              </div>
+              <p className="field-hint">
+                {t("填 0 表示沿用默认值（解压后 32 MiB、压缩前 64 MiB）。长会话叠加多张图片时请求体可能超过 32 MiB，此时会被 helper 以 413 拒绝，可在此调大。压缩前上限留空时自动取解压后上限的 2 倍。上限最大 1024 MiB。")}
+              </p>
+              <p className="field-hint">
+                {t("也可用环境变量 CODEX_PLUS_MAX_HTTP_BODY_BYTES / CODEX_PLUS_MAX_HTTP_ENCODED_BODY_BYTES 覆盖（单位字节，优先级高于此处）。修改后需重启 Codex++ 生效。")}
+              </p>
+            </CardContent>
+          </Panel>
         </>
       ) : (
         <Panel>
@@ -10907,6 +10957,8 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
     ...settings,
     updateSource: normalizeUpdateSource(settings.updateSource),
     updateSourceCustomRepo: (settings.updateSourceCustomRepo || "").trim(),
+    codexPlusMaxHttpBodyMb: clampNumber(settings.codexPlusMaxHttpBodyMb ?? 0, 0, 1024),
+    codexPlusMaxHttpEncodedBodyMb: clampNumber(settings.codexPlusMaxHttpEncodedBodyMb ?? 0, 0, 1024),
     relayProfilesEnabled: settings.relayProfilesEnabled !== false,
     codexAppImageOverlayOpacity: clampNumber(settings.codexAppImageOverlayOpacity || 35, 1, 100),
     codexAppImageOverlayFitMode: normalizeImageOverlayFitMode(settings.codexAppImageOverlayFitMode),

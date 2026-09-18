@@ -1113,6 +1113,16 @@ export const EN_PLAIN: Record<string, string> = {
   "添加环境变量": "Add variable",
   "留空则用默认目录": "Leave empty for the default directory",
   "请求头": "Headers",
+  "请求体大小上限": "Request body size limit",
+  "helper 端口转发 /v1/responses 时接受的请求体上限":
+    "Maximum request body the helper port accepts when forwarding /v1/responses",
+  "解压后上限（MiB）": "Decoded limit (MiB)",
+  "压缩前上限（MiB）": "Encoded limit (MiB)",
+  "默认 2 倍解压后上限": "Defaults to 2x the decoded limit",
+  "填 0 表示沿用默认值（解压后 32 MiB、压缩前 64 MiB）。长会话叠加多张图片时请求体可能超过 32 MiB，此时会被 helper 以 413 拒绝，可在此调大。压缩前上限留空时自动取解压后上限的 2 倍。上限最大 1024 MiB。":
+    "0 keeps the default (32 MiB decoded, 64 MiB encoded). Long conversations with several images can exceed 32 MiB and get rejected by the helper with 413 — raise it here. Leaving the encoded limit at 0 derives it as 2x the decoded limit. Maximum 1024 MiB.",
+  "也可用环境变量 CODEX_PLUS_MAX_HTTP_BODY_BYTES / CODEX_PLUS_MAX_HTTP_ENCODED_BODY_BYTES 覆盖（单位字节，优先级高于此处）。修改后需重启 Codex++ 生效。":
+    "You can also override with the CODEX_PLUS_MAX_HTTP_BODY_BYTES / CODEX_PLUS_MAX_HTTP_ENCODED_BODY_BYTES environment variables (in bytes, taking precedence over these fields). Restart Codex++ for changes to take effect.",
   "添加请求头": "Add header",
   "Bearer Token": "Bearer token",
   "留空则不写入": "Leave empty to omit",
