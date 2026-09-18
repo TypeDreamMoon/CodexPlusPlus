@@ -8,6 +8,10 @@
 //   - tauri.conf.json       → Tauri 应用版本
 //
 // 只改这三处，不做别的；无参数时打印当前版本，方便本地核对。
+//
+// 注意：本脚本会在 Windows runner 上以 CRLF 检出运行（这几个文件没有
+// .gitattributes 的 eol 规则），所以所有匹配都不能假设行尾是 LF，并且
+// 改写时只替换匹配到的那一小段，其它字节原样保留。
 
 import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -25,18 +29,50 @@ export function normalizeVersion(input) {
   return text;
 }
 
+/**
+ * 在 `[workspace.package]` 段内把 version 换成新值。
+ *
+ * 先定位段头，再从段头往后找第一条 `version = "…"`，用捕获组回填以保留
+ * 原有的空格与引号风格；行尾统一按 `\r?\n` 处理，CRLF/LF 都能命中。
+ */
+export function stampCargoTomlText(text, version) {
+  const header = /^\[workspace\.package\][^\S\r\n]*\r?$/m.exec(text);
+  if (!header) throw new Error("Cargo.toml 缺少 [workspace.package] 段");
+
+  const afterHeader = header.index + header[0].length;
+  const rest = text.slice(afterHeader);
+  // 段的结束：下一个以 `[` 开头的行；没有就到文件末尾。
+  const nextSection = /^\[/m.exec(rest);
+  const sectionEnd = nextSection ? afterHeader + nextSection.index : text.length;
+
+  const section = text.slice(afterHeader, sectionEnd);
+  const versionLine = /^([^\S\r\n]*)version([^\S\r\n]*=[^\S\r\n]*")([^"]*)(")/m.exec(section);
+  if (!versionLine) {
+    throw new Error(
+      "Cargo.toml 的 [workspace.package] 段里没找到 version 行：" +
+        JSON.stringify(section),
+    );
+  }
+
+  const lineStart = afterHeader + versionLine.index;
+  const replaced = versionLine[1] + "version" + versionLine[2] + version + versionLine[4];
+  const lineEnd = lineStart + versionLine[0].length;
+  return text.slice(0, lineStart) + replaced + text.slice(lineEnd);
+}
+
+function readWorkspacePackageSection(text) {
+  const header = /^\[workspace\.package\][^\S\r\n]*\r?$/m.exec(text);
+  if (!header) throw new Error("Cargo.toml 缺少 [workspace.package] 段");
+  const afterHeader = header.index + header[0].length;
+  const rest = text.slice(afterHeader);
+  const nextSection = /^\[/m.exec(rest);
+  return text.slice(afterHeader, nextSection ? afterHeader + nextSection.index : text.length);
+}
+
 function stampCargoToml(version) {
   const file = path.join(repoRoot, "Cargo.toml");
-  const before = readFileSync(file, "utf8");
-  // 只替换 [workspace.package] 段里的 version，避免碰到依赖表里的 version。
-  const sectionStart = before.indexOf("[workspace.package]");
-  if (sectionStart === -1) throw new Error("Cargo.toml 缺少 [workspace.package]");
-  const nextSection = before.indexOf("\n[", sectionStart + 1);
-  const end = nextSection === -1 ? before.length : nextSection;
-  const section = before.slice(sectionStart, end);
-  const stamped = section.replace(/^version\s*=\s*"[^"]*"/m, `version = "${version}"`);
-  if (stamped === section) throw new Error("Cargo.toml 的 [workspace.package] 里没找到 version");
-  writeFileSync(file, before.slice(0, sectionStart) + stamped + before.slice(end), "utf8");
+  const text = readFileSync(file, "utf8");
+  writeFileSync(file, stampCargoTomlText(text, version), "utf8");
 }
 
 function stampPackageJson(version) {
@@ -56,9 +92,8 @@ function stampTauriConf(version) {
 /** 当前三处 manifest 声明的版本（以 Cargo.toml 为准，并校验三者一致）。 */
 export function readStampedVersions() {
   const cargo = readFileSync(path.join(repoRoot, "Cargo.toml"), "utf8");
-  const sectionStart = cargo.indexOf("[workspace.package]");
-  const section = cargo.slice(sectionStart, cargo.indexOf("\n[", sectionStart + 1));
-  const cargoVersion = /^version\s*=\s*"([^"]*)"/m.exec(section)?.[1];
+  const section = readWorkspacePackageSection(cargo);
+  const cargoVersion = /^[^\S\r\n]*version[^\S\r\n]*=[^\S\r\n]*"([^"]*)"/m.exec(section)?.[1];
   const pkg = JSON.parse(
     readFileSync(path.join(repoRoot, "apps", "codex-plus-manager", "package.json"), "utf8"),
   ).version;

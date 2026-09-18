@@ -7,6 +7,13 @@
 *.sh text eol=lf
 .github/workflows/*.yml text eol=lf
 
+# 版本号由 tools/version-stamp.mjs 在 CI 构建前改写，它按文本处理这几个文件。
+# 固定成 LF，避免 Windows runner（core.autocrlf=true）检出成 CRLF 后出现
+# 「本地能改、CI 上改不动」这类只在一个平台复现的问题。
+Cargo.toml text eol=lf
+package.json text eol=lf
+tauri.conf.json text eol=lf
+
 # First-party scripts are embedded with include_str! and inspected by source-contract tests.
 assets/inject/*.js text eol=lf
 assets/inject/**/*.js text eol=lf
